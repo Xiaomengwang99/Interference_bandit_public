@@ -8,6 +8,15 @@ with randomly generated heterogeneous treatment effects.
 Each SGE array task ID maps to one of 75 villages. For each village, the
 experiment is repeated NUM_RUNS times with different random seeds.
 
+NOTE ON REUSED BASELINE RESULTS:
+    The Baseline algorithm call below is intentionally left in source but
+    commented out. For publication runs, Baseline is reused from previous
+    simulations (see output_village_new_algos2/). Only NETC, NSE, and
+    NSE-FS are re-run with the final algorithm configurations:
+      - NSE:    one-hot estimator, tau_constant=0.2
+      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
+      - NETC:   lambda_explore=0.035
+
 Usage
 -----
     SGE_TASK_ID=1 python run_village.py    # village 1
@@ -35,16 +44,14 @@ SIGNAL_STRENGTH = 0.1
 BASE_SPARSITY = 10
 TAU = 20000
 BASELINE_LAMBDA = 1
-NETC_LAMBDA1 = 0.035
-NETC_LAMBDA2 = 1.0
-NSE_TAU_CONSTANT = 0.1
-NSE_ALPHA = 1.0
+NETC_LAMBDA = 0.035
+NSE_TAU_CONSTANT = 0.2
 NSEFS_ALPHA = 0.05
 NSEFS_EST_ALPHA = 1.0
 NUM_RUNS = 5
 RUN_SEED_OFFSET = 10000
 
-OUTPUT_DIR = Path("output_village")
+OUTPUT_DIR = Path(__file__).resolve().parent / "output_village"
 
 
 def _get_job_id():
@@ -87,33 +94,30 @@ def _run_single(X, village_number, run_index, run_seed):
 
     print(f"[village {village_number}, run {run_index + 1}] d={d}, s={s}, T1={T1}")
 
-    baseline = BaselineBandit(
-        X, tau=tau, b=b, lambda_confidence=BASELINE_LAMBDA,
-        reg_param=0, sparsity=s, R_max=R_max, random_state=run_seed + 1,
-    )
-    baseline_results = baseline.run()
+    # --- Baseline (Algorithm 3) ---
+    # Reused from previous simulation outputs; do not re-run here.
+    # baseline = BaselineBandit(
+    #     X, tau=tau, b=b, lambda_confidence=BASELINE_LAMBDA,
+    #     reg_param=0, sparsity=s, R_max=R_max, random_state=run_seed + 1,
+    # )
+    # baseline_results = baseline.run()
 
-    netc1 = NETCBandit(
+    netc = NETCBandit(
         X, tau=tau, b=b, exploration_rounds=T1,
-        lambda_explore=NETC_LAMBDA1, random_state=run_seed + 2,
+        lambda_explore=NETC_LAMBDA, random_state=run_seed + 2,
     )
-    netc1_results = netc1.run()
-
-    netc2 = NETCBandit(
-        X, tau=tau, b=b, exploration_rounds=T1,
-        lambda_explore=NETC_LAMBDA2, random_state=run_seed + 3,
-    )
-    netc2_results = netc2.run()
+    netc_results = netc.run()
 
     nse = NSEBandit(
         X, tau=tau, tau_constant=NSE_TAU_CONSTANT,
-        estimation_alpha=NSE_ALPHA, random_state=run_seed + 4,
+        estimation_method="onehot", random_state=run_seed + 4,
     )
     nse_results = nse.run()
 
     nsefs = NSEFSBandit(
         X, tau=tau, alpha=NSEFS_ALPHA,
-        estimation_alpha=NSEFS_EST_ALPHA, random_state=run_seed + 5,
+        estimation_alpha=NSEFS_EST_ALPHA,
+        estimation_method="ridge", random_state=run_seed + 5,
     )
     nsefs_results = nsefs.run()
 
@@ -126,26 +130,27 @@ def _run_single(X, village_number, run_index, run_seed):
             "village_number": village_number,
         },
         "results": {
-            "baseline": _json_ready(baseline_results),
-            "netc_lambda1": _json_ready(netc1_results),
-            "netc_lambda2": _json_ready(netc2_results),
+            # "baseline": _json_ready(baseline_results),  # reused from old outputs
+            "netc": _json_ready(netc_results),
             "nse": _json_ready(nse_results),
             "nsefs": _json_ready(nsefs_results),
         },
     }
 
 
-def main():
-    job_id = _get_job_id()
+def _run_one_job(job_id):
     village_number = _get_village_number(job_id)
     x_seed = job_id + 200
 
     X = generate_village_network(x_seed, village_number, SIGNAL_STRENGTH)
     print(f"Village {village_number}: d={X.shape[0]}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for run_idx in range(NUM_RUNS):
         run_seed = job_id * RUN_SEED_OFFSET + run_idx + 1
+        path = OUTPUT_DIR / f"village_{village_number}_run_{run_idx + 1}_seed_{run_seed}.json"
+        if path.exists():
+            print(f"[village {village_number} run {run_idx + 1}] already exists, skipping.")
+            continue
         run_results = _run_single(X, village_number, run_idx, run_seed)
 
         payload = {
@@ -154,10 +159,27 @@ def main():
             "x_seed": x_seed,
             "run": run_results,
         }
-        path = OUTPUT_DIR / f"village_{village_number}_run_{run_idx + 1}_seed_{run_seed}.json"
         with path.open("w") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f)
         print(f"Saved run {run_idx + 1}/{NUM_RUNS} to {path}.")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task-start", type=int, default=None)
+    parser.add_argument("--task-end", type=int, default=None)
+    args = parser.parse_args()
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.task_start is not None and args.task_end is not None:
+        job_ids = range(args.task_start, args.task_end + 1)
+    else:
+        job_ids = [_get_job_id()]
+
+    for job_id in job_ids:
+        _run_one_job(job_id)
 
 
 if __name__ == "__main__":

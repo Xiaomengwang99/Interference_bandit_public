@@ -1,8 +1,17 @@
 """
-Signal strength sweep: evaluate all algorithms under varying signal strengths.
+Signal strength sweep: evaluate algorithms under varying signal strengths.
 
 Part of the robustness experiments in Appendix D. Each SGE array task maps
 to a (signal_strength, within-bucket seed) pair.
+
+NOTE ON REUSED BASELINE RESULTS:
+    The Baseline algorithm call below is intentionally left in source but
+    commented out. For publication runs, Baseline is reused from previous
+    simulations (see output_simulations_new_signal_partial01/). Only NETC,
+    NSE, and NSE-FS are re-run with the final algorithm configurations:
+      - NSE:    one-hot estimator, tau_constant=0.2
+      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
+      - NETC:   lambda_explore=0.035
 
 Usage
 -----
@@ -30,17 +39,15 @@ DEFAULT_S = 20
 DEFAULT_TAU = 20000
 DEFAULT_B = 100
 DEFAULT_T1 = 200
-NETC_LAMBDA1 = 0.035
-NETC_LAMBDA2 = 1.0
-NSE_TAU_CONSTANT = 0.1
-NSE_ALPHA = 1.0
+NETC_LAMBDA = 0.035
+NSE_TAU_CONSTANT = 0.2
 NSEFS_ALPHA = 0.05
 NSEFS_EST_ALPHA = 1.0
 
 # --- Sweep configuration ---
 SIGNAL_VALUES = [0.01, 0.05, 0.1, 0.15, 0.2, 0.5]
 BUCKET_SIZE = 100  # seeds per signal value
-OUTPUT_DIR = Path("output_sweep_signal")
+OUTPUT_DIR = Path(__file__).resolve().parent / "output_sweep_signal"
 
 
 def _get_job_id():
@@ -82,21 +89,22 @@ def _run_single_seed(seed, signal_strength):
     print(f"[seed {seed}] signal={signal_strength}, d={d}, s={s}, T={tau}")
     X = generate_network(seed, d, s, signal_strength)
 
-    baseline = BaselineBandit(
-        X, tau=tau, b=b, lambda_confidence=1, reg_param=0, sparsity=s, R_max=R_max,
-    )
-    baseline_results = baseline.run()
+    # --- Baseline (Algorithm 3) ---
+    # Reused from previous simulation outputs; do not re-run here.
+    # baseline = BaselineBandit(
+    #     X, tau=tau, b=b, lambda_confidence=1, reg_param=0, sparsity=s, R_max=R_max,
+    # )
+    # baseline_results = baseline.run()
 
-    netc1 = NETCBandit(X, tau=tau, b=b, exploration_rounds=T1, lambda_explore=NETC_LAMBDA1)
-    netc1_results = netc1.run()
+    netc = NETCBandit(X, tau=tau, b=b, exploration_rounds=T1, lambda_explore=NETC_LAMBDA)
+    netc_results = netc.run()
 
-    netc2 = NETCBandit(X, tau=tau, b=b, exploration_rounds=T1, lambda_explore=NETC_LAMBDA2)
-    netc2_results = netc2.run()
-
-    nse = NSEBandit(X, tau=tau, tau_constant=NSE_TAU_CONSTANT, estimation_alpha=NSE_ALPHA)
+    nse = NSEBandit(X, tau=tau, tau_constant=NSE_TAU_CONSTANT, estimation_method="onehot")
     nse_results = nse.run()
 
-    nsefs = NSEFSBandit(X, tau=tau, alpha=NSEFS_ALPHA, estimation_alpha=NSEFS_EST_ALPHA)
+    nsefs = NSEFSBandit(X, tau=tau, alpha=NSEFS_ALPHA,
+                        estimation_alpha=NSEFS_EST_ALPHA,
+                        estimation_method="ridge")
     nsefs_results = nsefs.run()
 
     return {
@@ -106,9 +114,8 @@ def _run_single_seed(seed, signal_strength):
             "signal_strength": signal_strength, "R_max": R_max, "T1": T1,
         },
         "results": {
-            "baseline": _json_ready(baseline_results),
-            "netc_lambda1": _json_ready(netc1_results),
-            "netc_lambda2": _json_ready(netc2_results),
+            # "baseline": _json_ready(baseline_results),  # reused from old outputs
+            "netc": _json_ready(netc_results),
             "nse": _json_ready(nse_results),
             "nsefs": _json_ready(nsefs_results),
         },
@@ -116,15 +123,30 @@ def _run_single_seed(seed, signal_strength):
 
 
 def main():
-    seed = _get_job_id()
-    signal_strength = _signal_from_seed(seed)
-    results = _run_single_seed(seed, signal_strength)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task-start", type=int, default=None)
+    parser.add_argument("--task-end", type=int, default=None)
+    args = parser.parse_args()
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    safe = str(signal_strength).replace(".", "p")
-    path = OUTPUT_DIR / f"seed_{seed}_signal_{safe}.json"
-    with path.open("w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved to {path}.")
+
+    if args.task_start is not None and args.task_end is not None:
+        seeds = range(args.task_start, args.task_end + 1)
+    else:
+        seeds = [_get_job_id()]
+
+    for seed in seeds:
+        signal_strength = _signal_from_seed(seed)
+        safe = str(signal_strength).replace(".", "p")
+        path = OUTPUT_DIR / f"seed_{seed}_signal_{safe}.json"
+        if path.exists():
+            print(f"[seed {seed}] already exists, skipping.")
+            continue
+        results = _run_single_seed(seed, signal_strength)
+        with path.open("w") as f:
+            json.dump(results, f)
+        print(f"Saved to {path}.")
 
 
 if __name__ == "__main__":

@@ -120,9 +120,18 @@ def generate_village_network(seed, village_number, signal_strength):
             f"Village number {village_number} is not valid. "
             f"Must be one of {VILLAGE_NUMBERS.tolist()}."
         )
-    folder_path = "datav4.0/Data/1. Network Data/Adjacency Matrices/"
-    file = f"adj_allVillageRelationships_HH_vilno_{village_number}.csv"
-    adj_matrix = pd.read_csv(folder_path + file, header=None)
+    # Village adjacency data lives at <repo_root>/datav4.0/... (one level
+    # above this algorithms.py file, which is at <repo_root>/Final_code/).
+    # Anchor the path to the module file so the loader works regardless of
+    # where the script is run from.
+    import os
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    data_root = os.path.normpath(os.path.join(module_dir, os.pardir))
+    folder_path = os.path.join(
+        data_root, "datav4.0", "Data", "1. Network Data", "Adjacency Matrices"
+    )
+    file_name = f"adj_allVillageRelationships_HH_vilno_{village_number}.csv"
+    adj_matrix = pd.read_csv(os.path.join(folder_path, file_name), header=None)
     if adj_matrix.shape[0] != adj_matrix.shape[1]:
         raise ValueError(f"Adjacency matrix for village {village_number} is not square.")
 
@@ -162,14 +171,22 @@ def _fit_ridge_matrix(actions, rewards, alpha):
     """
     actions = np.asarray(actions, dtype=float)
     rewards = np.asarray(rewards, dtype=float)
-    ridge = Ridge(alpha=alpha, fit_intercept=False)
+    ridge = Ridge(alpha=alpha, fit_intercept=True)
     ridge.fit(actions, rewards)
     coef = ridge.coef_
     residuals = rewards - ridge.predict(actions)
     XtX = actions.T @ actions
     identity = np.identity(actions.shape[1])
     ridge_matrix = XtX + alpha * identity
-    ridge_inv = np.linalg.pinv(ridge_matrix)
+    # Use np.linalg.solve (LU decomposition) instead of np.linalg.pinv (SVD)
+    # for robustness: ridge_matrix is positive definite (alpha > 0), so LU
+    # is appropriate and avoids SVD convergence failures that can occur on
+    # certain near-singular patterns (observed on large village networks).
+    try:
+        ridge_inv = np.linalg.solve(ridge_matrix, identity)
+    except np.linalg.LinAlgError:
+        # Fallback: pseudo-inverse with slight extra regularization.
+        ridge_inv = np.linalg.pinv(ridge_matrix + 1e-8 * identity)
     gram = ridge_inv @ XtX @ ridge_inv
     common_diag = np.diag(gram)
     dof = max(actions.shape[0] - actions.shape[1], 1)
@@ -182,34 +199,33 @@ def _fit_ridge_matrix(actions, rewards, alpha):
 
 
 def _fit_lasso_matrix(actions, rewards, alpha):
-    """Fit a multi-output Lasso (with CV) and return coefficient / variance info."""
+    """Fit per-outcome-row Lasso with a fixed alpha and return coef / variance info.
+
+    Runs d independent Lasso regressions (one per outcome coordinate), giving
+    each outcome row its own sparsity pattern. Uses fit_intercept=True so both
+    actions and rewards are centered before the L1 fit.
+    """
     actions = np.asarray(actions, dtype=float)
     rewards = np.asarray(rewards, dtype=float)
-    if actions.shape[0] < 2:
-        coef = np.linalg.pinv(actions) @ rewards
-        residuals = rewards - actions @ coef
-        XtX = actions.T @ actions
-        identity = np.identity(actions.shape[1])
-        reg_matrix = XtX + alpha * identity
-        reg_inv = np.linalg.pinv(reg_matrix)
-        gram = reg_inv @ XtX @ reg_inv
-        common_diag = np.diag(gram)
+    n, d = actions.shape
+    if n < 2:
+        coef = (np.linalg.pinv(actions) @ rewards).T
+        residuals = rewards - actions @ coef.T
     else:
-        cv_folds = min(5, actions.shape[0])
-        if cv_folds < 2:
-            cv_folds = 2
-        model = MultiTaskLassoCV(cv=cv_folds, fit_intercept=False, max_iter=10000)
-        model.fit(actions, rewards)
-        coef = model.coef_
-        residuals = rewards - model.predict(actions)
-        XtX = actions.T @ actions
-        identity = np.identity(actions.shape[1])
-        best_alpha = getattr(model, "alpha_", alpha)
-        reg_matrix = XtX + best_alpha * identity
-        reg_inv = np.linalg.pinv(reg_matrix)
-        gram = reg_inv @ XtX @ reg_inv
-        common_diag = np.diag(gram)
-    dof = max(actions.shape[0] - actions.shape[1], 1)
+        coef = np.zeros((rewards.shape[1], d))
+        residuals = np.zeros_like(rewards)
+        for i in range(rewards.shape[1]):
+            model = Lasso(alpha=alpha, fit_intercept=True, max_iter=10000)
+            model.fit(actions, rewards[:, i])
+            coef[i, :] = model.coef_
+            residuals[:, i] = rewards[:, i] - model.predict(actions)
+    XtX = actions.T @ actions
+    identity = np.identity(d)
+    reg_matrix = XtX + alpha * identity
+    reg_inv = np.linalg.pinv(reg_matrix)
+    gram = reg_inv @ XtX @ reg_inv
+    common_diag = np.diag(gram)
+    dof = max(n - d, 1)
     sigma2 = np.maximum(np.sum(residuals ** 2, axis=0) / dof, 1e-12)
     return {
         "coef": coef,
@@ -218,9 +234,10 @@ def _fit_lasso_matrix(actions, rewards, alpha):
     }
 
 
-def _fit_estimator_matrix(actions, rewards, alpha):
-    """Dispatch to ridge or lasso based on the global ESTIMATION_METHOD flag."""
-    if ESTIMATION_METHOD == "ridge":
+def _fit_estimator_matrix(actions, rewards, alpha, method=None):
+    """Dispatch to ridge or lasso. `method` overrides the global ESTIMATION_METHOD flag."""
+    chosen = method if method is not None else ESTIMATION_METHOD
+    if chosen == "ridge":
         return _fit_ridge_matrix(actions, rewards, alpha)
     return _fit_lasso_matrix(actions, rewards, alpha)
 
@@ -452,10 +469,11 @@ class NSEBandit(BaseBandit):
     """
 
     def __init__(self, X, tau, noise_std=1.0, random_state=None,
-                 tau_constant=0.1, estimation_alpha=1.0):
+                 tau_constant=0.1, estimation_alpha=1.0, estimation_method=None):
         super().__init__(X, tau, b=100, noise_std=noise_std, random_state=random_state)
         self.tau_constant = tau_constant
         self.estimation_alpha = float(estimation_alpha)
+        self.estimation_method = estimation_method
 
     def _rho_vector(self):
         """Compute column support sizes rho_j = |{i : X*_{ij} != 0}|."""
@@ -532,20 +550,45 @@ class NSEBandit(BaseBandit):
                 2 * np.log(2 * max(self.tau, 1)) / total_samples
             )
 
-            actions_array = np.asarray(actions_history, dtype=float)
-            rewards_array = np.asarray(rewards_history, dtype=float)
-            estimation_info = _fit_estimator_matrix(
-                actions_array, rewards_array, self.estimation_alpha
-            )
-            coef_matrix = estimation_info["coef"]
-            if uncertain_indices.size:
-                X_hat_estimates[:, uncertain_indices] = coef_matrix[:, uncertain_indices]
-            theta_hat[:] = X_hat_estimates.sum(axis=0)
+            if self.estimation_method == "onehot":
+                # Paper Algorithm 2, line 16: one-hot estimator using only the
+                # current batch D_m (not accumulated history):
+                #   X_hat_ij = (1/|D_m|) sum_{t in D_m} Y_{t,i} * a_{t,j}
+                batch_start = total_samples - batch_size
+                A_m = np.asarray(
+                    actions_history[batch_start:total_samples], dtype=float
+                )  # shape (|D_m|, d)
+                Y_m = np.asarray(
+                    rewards_history[batch_start:total_samples], dtype=float
+                )  # shape (|D_m|, d)
+                Dm = A_m.shape[0]
+                if uncertain_indices.size and Dm > 0:
+                    # X_hat[i, j] = (1/|D_m|) sum_t Y_m[t, i] * A_m[t, j]
+                    coef_uncertain = (
+                        Y_m.T @ A_m[:, uncertain_indices]
+                    ) / Dm  # shape (d, len(uncertain_indices))
+                    X_hat_estimates[:, uncertain_indices] = coef_uncertain
+            else:
+                actions_array = np.asarray(actions_history, dtype=float)
+                rewards_array = np.asarray(rewards_history, dtype=float)
+                estimation_info = _fit_estimator_matrix(
+                    actions_array, rewards_array, self.estimation_alpha,
+                    method=self.estimation_method,
+                )
+                coef_matrix = estimation_info["coef"]
+                if uncertain_indices.size:
+                    X_hat_estimates[:, uncertain_indices] = coef_matrix[:, uncertain_indices]
+            # Hard-thresholded column sum:
+            # theta_hat_j = sum_i X_hat_ij * 1{|X_hat_ij| >= tau_m}.
+            # Entries below the noise floor tau_m are zeroed out so only
+            # confidently non-zero estimates contribute.
+            truncated = np.where(np.abs(X_hat_estimates) >= tau_m, X_hat_estimates, 0.0)
+            theta_hat[:] = truncated.sum(axis=0)
 
             # Elimination step (Eq. following Algorithm 1, line 20).
             if batch_size >= MIN_ELIM_BATCH:
                 uncertain_mask = uncertain_mask & (
-                    np.abs(theta_hat) <= 2 * rho_vec * tau_m
+                    np.abs(theta_hat) <= rho_vec * tau_m
                 )
             samples_collected = target
             print(
@@ -587,14 +630,14 @@ class NSEFSBandit(BaseBandit):
     """
 
     def __init__(self, X, tau, noise_std=1.0, random_state=None,
-                 alpha=0.05, estimation_alpha=1.0):
+                 alpha=0.05, estimation_alpha=1.0, estimation_method=None):
         super().__init__(X, tau, b=100, noise_std=noise_std, random_state=random_state)
         self.alpha = float(alpha)
         self.z_alpha = NormalDist().inv_cdf(1 - self.alpha / 2)
-        # Known column supports: S_j = {i : X*_{ij} != 0}.
         self.support_sets = [np.flatnonzero(self.X[:, j]) for j in range(self.d)]
         self.support_cardinality = np.array([len(s) for s in self.support_sets], dtype=int)
         self.estimation_alpha = float(estimation_alpha)
+        self.estimation_method = estimation_method
 
     def _batch_targets(self):
         """Compute batch boundary indices."""
@@ -672,7 +715,8 @@ class NSEFSBandit(BaseBandit):
             actions_array = np.asarray(actions_history, dtype=float)
             rewards_array = np.asarray(rewards_history, dtype=float)
             estimation_info = _fit_estimator_matrix(
-                actions_array, rewards_array, self.estimation_alpha
+                actions_array, rewards_array, self.estimation_alpha,
+                method=self.estimation_method,
             )
             coef_matrix = estimation_info["coef"]
             if uncertain_indices.size:
