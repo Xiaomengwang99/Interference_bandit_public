@@ -325,7 +325,7 @@ class _LassoExplorationMixin:
     row-wise Lasso regression is used to estimate each row of X*.
     """
 
-    def _run_lasso_exploration(self, rounds, lasso_alpha, noise_scale=0.1):
+    def _run_lasso_exploration(self, rounds, lasso_alpha):
         """Run the exploration phase and return estimated X, actions, rewards.
 
         Parameters
@@ -334,8 +334,6 @@ class _LassoExplorationMixin:
             Number of exploration rounds (T_1 in the paper).
         lasso_alpha : float
             L1 regularization parameter for Lasso.
-        noise_scale : float
-            Standard deviation of observation noise during exploration.
 
         Returns
         -------
@@ -351,7 +349,7 @@ class _LassoExplorationMixin:
         Y = np.empty((rounds, self.d))
         for t in range(rounds):
             action = self.sample_random_action()
-            reward = self.observe(action, noise_scale=noise_scale)
+            reward = self.observe(action)
             A[t] = action
             Y[t] = reward
 
