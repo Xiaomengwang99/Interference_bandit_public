@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local tooling and editor state
+.claude/
+.vscode/
+.idea/
+
+# Experiment outputs and local data
+output_*/
+datav4.0/
+
+# Anonymous conference packages should not include the non-anonymous README.
+# Keep README.md locally if needed, but submit README_ANONYMOUS.md instead.

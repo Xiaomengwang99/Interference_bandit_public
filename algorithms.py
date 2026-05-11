@@ -1,11 +1,11 @@
 """
 Bandit algorithms for learning to target with network interference.
 
-This module implements the four algorithms described in the paper:
-  - BaselineBandit    : Network-agnostic linear bandit (Algorithm 3)
-  - NSEBandit         : Network Successive Elimination with partial support knowledge (Algorithm 1)
-  - NSEFSBandit       : NSE with Full Support knowledge (Algorithm 4)
-  - NETCBandit        : Network Explore Then Commit, no support information (Algorithm 2)
+This module implements the algorithms described in the paper:
+  - BaselineBandit    : Network-agnostic linear bandit baseline (Section 3)
+  - NSEFSBandit       : NSE with Full Support knowledge (Algorithm 1)
+  - NSEBandit         : Network Successive Elimination with partial support knowledge (Algorithm 2)
+  - NETCBandit        : Network Explore Then Commit, no support information (Algorithm 3)
 
 It also provides data-generation utilities for simulated and semi-synthetic
 (Indian village) network experiments.
@@ -14,7 +14,6 @@ It also provides data-generation utilities for simulated and semi-synthetic
 
 import math
 import warnings
-from statistics import NormalDist
 from typing import Sequence
 
 import gurobipy as gp
@@ -22,7 +21,7 @@ import numpy as np
 import pandas as pd
 from gurobipy import GRB
 from numpy.linalg import norm
-from sklearn.linear_model import Lasso, MultiTaskLassoCV, Ridge
+from sklearn.linear_model import Lasso, Ridge
 
 # ---------------------------------------------------------------------------
 # Gurobi global settings
@@ -35,7 +34,7 @@ MAX_TIME_BASELINE = 10
 # Minimum batch size before elimination is attempted in batched algorithms.
 MIN_ELIM_BATCH = 64
 
-# Estimation method used in batched algorithms ("ridge" or "lasso").
+# Estimation method used in batched algorithms ("ridge", "lasso", or "ols").
 ESTIMATION_METHOD = "ridge"
 
 # Valid village numbers from the Indian village dataset (Banerjee et al., 2013).
@@ -120,10 +119,9 @@ def generate_village_network(seed, village_number, signal_strength):
             f"Village number {village_number} is not valid. "
             f"Must be one of {VILLAGE_NUMBERS.tolist()}."
         )
-    # Village adjacency data lives at <repo_root>/datav4.0/... (one level
-    # above this algorithms.py file, which is at <repo_root>/Final_code/).
-    # Anchor the path to the module file so the loader works regardless of
-    # where the script is run from.
+    # Village adjacency data lives one level above this file at
+    # <repo_root>/datav4.0/... Anchor the path to the module file so the
+    # loader works regardless of where the script is run from.
     import os
     module_dir = os.path.dirname(os.path.abspath(__file__))
     data_root = os.path.normpath(os.path.join(module_dir, os.pardir))
@@ -234,9 +232,42 @@ def _fit_lasso_matrix(actions, rewards, alpha):
     }
 
 
+def _fit_ols_matrix(actions, rewards, alpha=None):
+    """Fit centered multi-output OLS and return coefficient / variance info."""
+    del alpha
+    actions = np.asarray(actions, dtype=float)
+    rewards = np.asarray(rewards, dtype=float)
+    n, d = actions.shape
+    if n == 0:
+        return {
+            "coef": np.zeros((rewards.shape[1], d)),
+            "common_diag": np.zeros(d),
+            "sigma2": np.ones(rewards.shape[1]),
+        }
+
+    actions_centered = actions - actions.mean(axis=0)
+    rewards_centered = rewards - rewards.mean(axis=0)
+    coef_by_feature = np.linalg.pinv(actions_centered) @ rewards_centered
+    coef = coef_by_feature.T
+    residuals = rewards_centered - actions_centered @ coef_by_feature
+
+    XtX = actions_centered.T @ actions_centered
+    xtx_inv = np.linalg.pinv(XtX)
+    common_diag = np.diag(xtx_inv)
+    dof = max(n - d, 1)
+    sigma2 = np.maximum(np.sum(residuals ** 2, axis=0) / dof, 1e-12)
+    return {
+        "coef": coef,
+        "common_diag": np.nan_to_num(common_diag, nan=0.0, posinf=0.0, neginf=0.0),
+        "sigma2": sigma2,
+    }
+
+
 def _fit_estimator_matrix(actions, rewards, alpha, method=None):
-    """Dispatch to ridge or lasso. `method` overrides the global ESTIMATION_METHOD flag."""
+    """Dispatch to OLS, ridge, or lasso."""
     chosen = method if method is not None else ESTIMATION_METHOD
+    if chosen == "ols":
+        return _fit_ols_matrix(actions, rewards, alpha)
     if chosen == "ridge":
         return _fit_ridge_matrix(actions, rewards, alpha)
     return _fit_lasso_matrix(actions, rewards, alpha)
@@ -257,18 +288,15 @@ class BaseBandit:
         Population size.
     tau : int
         Time horizon.
-    b : int
-        Budget constraint (sum of actions <= b).
     """
 
-    def __init__(self, X, tau, b, noise_std=1.0, random_state=None):
+    def __init__(self, X, tau, noise_std=1.0, random_state=None):
         X = np.asarray(X, dtype=float)
         if X.shape[0] != X.shape[1]:
             raise ValueError("X must be a square matrix.")
         self.X = X
         self.d = X.shape[0]
         self.tau = tau
-        self.b = b
         self.noise_std = noise_std
         self.rng = np.random.default_rng(random_state)
         self._true_action_cache = None
@@ -277,25 +305,21 @@ class BaseBandit:
         """Draw a uniformly random action in [-1, 1]^d."""
         return self.rng.uniform(-1, 1, self.d)
 
+    def sample_random_binary_action(self):
+        """Draw a uniformly random action in {-1, +1}^d."""
+        return self.rng.choice([-1.0, 1.0], size=self.d)
+
     def observe(self, action, noise_scale=None):
         """Observe reward vector Y_t = X * a_t + epsilon_t."""
         noise = self.rng.normal(0, noise_scale or self.noise_std, self.d)
         return self.X @ action + noise
 
     def _solve_true_action(self):
-        """Compute the optimal action a* = argmax 1^T X a subject to constraints."""
+        """Compute the optimal action a* = argmax 1^T X a over [-1, 1]^d."""
         if self._true_action_cache is not None:
             return self._true_action_cache
-        model = gp.Model("true_opt")
-        model.setParam("Threads", MAX_THREADS)
-        a_vars = model.addVars(self.d, lb=-1, ub=1, name="a")
-        model.addConstr(gp.quicksum(a_vars[i] for i in range(self.d)) <= self.b, "budget")
-        objective = gp.LinExpr()
-        for row in range(self.d):
-            objective += gp.quicksum(self.X[row, col] * a_vars[col] for col in range(self.d))
-        model.setObjective(objective, GRB.MAXIMIZE)
-        model.optimize()
-        solution = np.array([a_vars[i].X for i in range(self.d)])
+        theta = np.sum(self.X, axis=0)
+        solution = np.where(theta >= 0, 1.0, -1.0)
         self._true_action_cache = solution
         return solution
 
@@ -319,9 +343,9 @@ class BaseBandit:
 # ============================================================================
 
 class _LassoExplorationMixin:
-    """Provides the Lasso-based exploration phase for NETC (Algorithm 2).
+    """Provides the Lasso-based exploration phase for NETC (Algorithm 3).
 
-    During exploration, actions are sampled uniformly at random and
+    During exploration, actions are sampled uniformly from {-1, +1}^d and
     row-wise Lasso regression is used to estimate each row of X*.
     """
 
@@ -348,7 +372,7 @@ class _LassoExplorationMixin:
         A = np.empty((rounds, self.d))
         Y = np.empty((rounds, self.d))
         for t in range(rounds):
-            action = self.sample_random_action()
+            action = self.sample_random_binary_action()
             reward = self.observe(action)
             A[t] = action
             Y[t] = reward
@@ -364,19 +388,19 @@ class _LassoExplorationMixin:
 
 
 # ============================================================================
-# Algorithm 2: NETC -- Network Explore Then Commit (no support information)
+# Algorithm 3: NETC -- Network Explore Then Commit (no support information)
 # ============================================================================
 
 class NETCBandit(_LassoExplorationMixin, BaseBandit):
-    """Network Explore Then Commit (NETC) -- Algorithm 2 in the paper.
+    """Network Explore Then Commit (NETC) -- Algorithm 3 in the paper.
 
     This algorithm is designed for the setting where no structural
     information about the network is available. It uses an explore-then-commit
     strategy:
       1. Exploration: sample random actions for T_1 rounds and estimate X*
-         via row-wise Lasso regression (Eq. 5 in the paper).
-      2. Exploitation: solve for the best action using the estimated X_hat
-         and commit to it for the remaining rounds (Eq. 6).
+         via row-wise Lasso regression (Eq. 7 in the paper).
+      2. Exploitation: commit to sign(theta_hat), where theta_hat is the
+         column sum of the estimated X_hat.
 
     Under Assumptions 1 and 2, NETC achieves expected regret
     O~(d (s * tau)^{2/3}).
@@ -387,40 +411,29 @@ class NETCBandit(_LassoExplorationMixin, BaseBandit):
         True treatment effect matrix (for simulation/regret computation).
     tau : int
         Time horizon T.
-    b : int
-        Budget constraint.
     exploration_rounds : int
         Number of exploration rounds T_1.
     lambda_explore : float
         Lasso regularization parameter.
     """
 
-    def __init__(self, X, tau, b, exploration_rounds, lambda_explore,
+    def __init__(self, X, tau, exploration_rounds, lambda_explore,
                  noise_std=1.0, random_state=None):
-        super().__init__(X, tau, b, noise_std=noise_std, random_state=random_state)
+        super().__init__(X, tau, noise_std=noise_std, random_state=random_state)
         self.t1 = min(exploration_rounds, tau)
         self.lambda_explore = lambda_explore
 
-    def _solve_commit_action(self, X_hat):
-        """Solve for the best action given estimated X_hat (Eq. 6)."""
-        model = gp.Model("netc_commit")
-        model.setParam("Threads", MAX_THREADS)
-        a_vars = model.addVars(self.d, lb=-1, ub=1, name="a")
-        model.addConstr(gp.quicksum(a_vars[i] for i in range(self.d)) <= self.b, "budget")
-        objective = gp.LinExpr()
-        for row in range(self.d):
-            for col in range(self.d):
-                objective += X_hat[row, col] * a_vars[col]
-        model.setObjective(objective, GRB.MAXIMIZE)
-        model.optimize()
-        return np.array([a_vars[i].X for i in range(self.d)])
+    def _commit_action(self, X_hat):
+        """Commit to sign(theta_hat), where theta_hat is the column sum of X_hat."""
+        theta_hat = np.sum(X_hat, axis=0)
+        return np.where(theta_hat >= 0, 1.0, -1.0)
 
     def run(self):
         """Execute the NETC algorithm and return per-round regrets."""
         print("[NETC] Running exploration phase.")
         X_hat, A_explore, _ = self._run_lasso_exploration(self.t1, self.lambda_explore)
 
-        a_commit = self._solve_commit_action(X_hat)
+        a_commit = self._commit_action(X_hat)
         exploitation_rounds = self.tau - self.t1
         print(f"[NETC] Committing to estimated optimal action for {exploitation_rounds} rounds.")
 
@@ -436,11 +449,11 @@ class NETCBandit(_LassoExplorationMixin, BaseBandit):
 
 
 # ============================================================================
-# Algorithm 1: NSE -- Network Successive Elimination (partial support knowledge)
+# Algorithm 2: NSE -- Network Successive Elimination (partial support knowledge)
 # ============================================================================
 
 class NSEBandit(BaseBandit):
-    """Network Successive Elimination (NSE) -- Algorithm 1 in the paper.
+    """Network Successive Elimination (NSE) -- Algorithm 2 in the paper.
 
     This algorithm is designed for the setting where the column support
     sizes {rho_j} are known. It operates in logarithmically many batches
@@ -449,7 +462,7 @@ class NSEBandit(BaseBandit):
          {-1, +1}; for resolved coordinates, commit to sign(theta_hat_j).
       2. At the end of each batch, update the estimator X_hat and theta_hat.
       3. Eliminate coordinate j from the uncertainty set if
-         |theta_hat_j| > 2 * rho_j * tau_m.
+         |theta_hat_j| > rho_j * tau_m.
 
     Under Assumptions 1 and 2 with known column support sizes, NSE achieves
     regret O~(sqrt(T) * sum_j rho_j), which is at most O~(d * s * sqrt(T)).
@@ -463,12 +476,12 @@ class NSEBandit(BaseBandit):
     tau_constant : float or list of float
         Scaling constant(s) for the elimination threshold tau_m.
     estimation_alpha : float
-        Ridge regularization parameter for estimation.
+        Regularization parameter for ridge/lasso estimation.
     """
 
     def __init__(self, X, tau, noise_std=1.0, random_state=None,
                  tau_constant=0.1, estimation_alpha=1.0, estimation_method=None):
-        super().__init__(X, tau, b=100, noise_std=noise_std, random_state=random_state)
+        super().__init__(X, tau, noise_std=noise_std, random_state=random_state)
         self.tau_constant = tau_constant
         self.estimation_alpha = float(estimation_alpha)
         self.estimation_method = estimation_method
@@ -549,7 +562,7 @@ class NSEBandit(BaseBandit):
             )
 
             if self.estimation_method == "onehot":
-                # Paper Algorithm 2, line 16: one-hot estimator using only the
+                # Paper Algorithm 2, line 15: one-hot estimator using only the
                 # current batch D_m (not accumulated history):
                 #   X_hat_ij = (1/|D_m|) sum_{t in D_m} Y_{t,i} * a_{t,j}
                 batch_start = total_samples - batch_size
@@ -583,7 +596,7 @@ class NSEBandit(BaseBandit):
             truncated = np.where(np.abs(X_hat_estimates) >= tau_m, X_hat_estimates, 0.0)
             theta_hat[:] = truncated.sum(axis=0)
 
-            # Elimination step (Eq. following Algorithm 1, line 20).
+            # Elimination step (Algorithm 2, line 20).
             if batch_size >= MIN_ELIM_BATCH:
                 uncertain_mask = uncertain_mask & (
                     np.abs(theta_hat) <= rho_vec * tau_m
@@ -601,16 +614,16 @@ class NSEBandit(BaseBandit):
 
 
 # ============================================================================
-# Algorithm 4: NSE-FS -- NSE with Full Support knowledge
+# Algorithm 1: NSE-FS -- NSE with Full Support knowledge
 # ============================================================================
 
 class NSEFSBandit(BaseBandit):
-    """NSE with Full Support knowledge (NSE-FS) -- Algorithm 4 in the paper.
+    """NSE with Full Support knowledge (NSE-FS) -- Algorithm 1 in the paper.
 
     This algorithm is designed for the setting where the full support S of
     X* is known (but effect magnitudes are unknown). It uses the same
     successive elimination framework as NSE, but leverages the known support
-    to construct tighter confidence intervals for each theta_j.
+    to hard-threshold each theta_j estimate with a rho_j-dependent threshold.
 
     Under Assumptions 1 and 2 with known support, NSE-FS achieves regret
     O~(sqrt(T) * sum_j rho_j), matching the lower bound up to log factors.
@@ -621,17 +634,23 @@ class NSEFSBandit(BaseBandit):
         True treatment effect matrix.
     tau : int
         Time horizon T.
-    alpha : float
-        Significance level for confidence intervals (e.g. 0.05).
-    estimation_alpha : float
-        Ridge regularization parameter for estimation.
+    threshold_delta : float
+        Failure-probability parameter used in the theoretical threshold.
+    threshold_constant : float
+        Leading constant in tau_m.
+    estimation_method : str
+        Estimator for the batch regression; defaults to "ols".
     """
 
     def __init__(self, X, tau, noise_std=1.0, random_state=None,
-                 alpha=0.05, estimation_alpha=1.0, estimation_method=None):
-        super().__init__(X, tau, b=100, noise_std=noise_std, random_state=random_state)
-        self.alpha = float(alpha)
-        self.z_alpha = NormalDist().inv_cdf(1 - self.alpha / 2)
+                 threshold_delta=0.05, threshold_constant=8.0,
+                 estimation_alpha=0.0, estimation_method="ols",
+                 alpha=None):
+        super().__init__(X, tau, noise_std=noise_std, random_state=random_state)
+        if alpha is not None:
+            threshold_delta = alpha
+        self.threshold_delta = float(threshold_delta)
+        self.threshold_constant = float(threshold_constant)
         self.support_sets = [np.flatnonzero(self.X[:, j]) for j in range(self.d)]
         self.support_cardinality = np.array([len(s) for s in self.support_sets], dtype=int)
         self.estimation_alpha = float(estimation_alpha)
@@ -653,20 +672,27 @@ class NSEFSBandit(BaseBandit):
         targets.append(self.tau)
         return targets
 
+    def _tau_m(self, batch_size):
+        """Theoretical NSE-FS threshold scale from Theorem 3."""
+        delta = max(self.threshold_delta, 1e-12)
+        log2_t = max(math.log2(max(self.tau, 2)), 1.0)
+        log_term = max(math.log(16 * (self.d ** 2) * log2_t / delta), 0.0)
+        return self.threshold_constant * math.sqrt(log_term / max(batch_size, 1))
+
     def run(self):
         """Execute the NSE-FS algorithm and return per-round regrets."""
         batch_targets = self._batch_targets()
 
         # Initialize tracking.
         self.theta_estimates = np.zeros(self.d)
-        self.ci_halfwidth = np.full(self.d, np.inf)
+        self.elimination_threshold = np.full(self.d, np.inf)
         uncertain_mask = np.ones(self.d, dtype=bool)
 
         # Coordinates with empty support are immediately resolved.
         zero_support = np.where(self.support_cardinality == 0)[0]
         if zero_support.size:
             uncertain_mask[zero_support] = False
-            self.ci_halfwidth[zero_support] = 0.0
+            self.elimination_threshold[zero_support] = 0.0
 
         actions_history = []
         rewards_history = []
@@ -709,9 +735,16 @@ class NSEFSBandit(BaseBandit):
                         f"uncertain={np.sum(uncertain_mask)}; batch={batch_idx + 1}."
                     )
 
-            # End-of-batch estimation.
-            actions_array = np.asarray(actions_history, dtype=float)
-            rewards_array = np.asarray(rewards_history, dtype=float)
+            # End-of-batch estimation. Algorithm 1 estimates from the current
+            # batch D_m rather than accumulated history.
+            total_samples = samples_collected + batch_size
+            batch_start = total_samples - batch_size
+            actions_array = np.asarray(
+                actions_history[batch_start:total_samples], dtype=float
+            )
+            rewards_array = np.asarray(
+                rewards_history[batch_start:total_samples], dtype=float
+            )
             estimation_info = _fit_estimator_matrix(
                 actions_array, rewards_array, self.estimation_alpha,
                 method=self.estimation_method,
@@ -719,33 +752,28 @@ class NSEFSBandit(BaseBandit):
             coef_matrix = estimation_info["coef"]
             if uncertain_indices.size:
                 X_hat_estimates[:, uncertain_indices] = coef_matrix[:, uncertain_indices]
-            theta_vector = X_hat_estimates.sum(axis=0)
             if uncertain_indices.size:
-                self.theta_estimates[uncertain_indices] = theta_vector[uncertain_indices]
+                for j in uncertain_indices:
+                    self.theta_estimates[j] = X_hat_estimates[self.support_sets[j], j].sum()
 
-            # Confidence interval construction using known support.
-            sigma2_sum = float(np.sum(estimation_info["sigma2"]))
-            var_theta_full = estimation_info["common_diag"] * max(sigma2_sum, 1e-12)
-            if uncertain_indices.size:
-                self.ci_halfwidth[uncertain_indices] = self.z_alpha * np.sqrt(
-                    np.maximum(var_theta_full[uncertain_indices], 1e-12)
-                )
+            tau_m = self._tau_m(batch_size)
+            self.elimination_threshold[uncertain_indices] = (
+                np.sqrt(self.support_cardinality[uncertain_indices]) * tau_m
+            )
             if zero_support.size:
                 self.theta_estimates[zero_support] = 0.0
-                self.ci_halfwidth[zero_support] = 0.0
+                self.elimination_threshold[zero_support] = 0.0
 
-            # Elimination: remove j if CI for theta_j excludes zero.
+            # Elimination: main-text Equation (6), using the OLS-phase threshold.
             if batch_size >= MIN_ELIM_BATCH:
-                for j in np.where(uncertain_mask)[0]:
-                    lower = self.theta_estimates[j] - self.ci_halfwidth[j]
-                    upper = self.theta_estimates[j] + self.ci_halfwidth[j]
-                    if not (lower <= 0.0 <= upper):
-                        uncertain_mask[j] = False
+                uncertain_mask = uncertain_mask & (
+                    np.abs(self.theta_estimates) <= self.elimination_threshold
+                )
 
             samples_collected = target
             print(
                 f"[NSE-FS] Batch {batch_idx + 1}/{len(batch_targets)} done; "
-                f"uncertain={np.sum(uncertain_mask)}."
+                f"uncertain={np.sum(uncertain_mask)}; tau_m={tau_m:.4f}."
             )
 
         actions = np.array(actions_history) if actions_history else np.empty((0, self.d))
@@ -755,11 +783,11 @@ class NSEFSBandit(BaseBandit):
 
 
 # ============================================================================
-# Algorithm 3: Baseline -- Network-agnostic linear bandit (LinUCB on Z_t)
+# Baseline -- Network-agnostic linear bandit (LinUCB on Z_t)
 # ============================================================================
 
 class BaselineBandit(BaseBandit):
-    """Baseline network-agnostic algorithm -- Algorithm 3 in the paper.
+    """Network-agnostic baseline from Section 3 of the paper.
 
     This algorithm ignores individual reward observations and instead works
     with the aggregated scalar reward Z_t = 1^T Y_t = theta^T a_t + eta_t
@@ -776,8 +804,6 @@ class BaselineBandit(BaseBandit):
         True treatment effect matrix.
     tau : int
         Time horizon T.
-    b : int
-        Budget constraint.
     lambda_confidence : float
         Regularization parameter for the confidence ellipsoid.
     reg_param : float
@@ -788,9 +814,12 @@ class BaselineBandit(BaseBandit):
         Upper bound on ||theta||.
     """
 
-    def __init__(self, X, tau, b, lambda_confidence, reg_param, sparsity,
+    def __init__(self, X, tau, lambda_confidence, reg_param, sparsity,
                  R_max, noise_std=None, random_state=None):
-        super().__init__(X, tau, b, noise_std=noise_std or X.shape[0], random_state=random_state)
+        aggregate_noise_std = np.sqrt(X.shape[0]) if noise_std is None else noise_std
+        super().__init__(
+            X, tau, noise_std=aggregate_noise_std, random_state=random_state
+        )
         self.lambda_confidence = lambda_confidence
         self.reg_param = reg_param
         self.sparsity = sparsity
@@ -812,7 +841,6 @@ class BaselineBandit(BaseBandit):
 
         a_vars = model.addVars(self.d, lb=-1, ub=1, name="a")
         x_vars = model.addVars(self.d, lb=-self.R_max, ub=self.R_max, name="x")
-        model.addConstr(gp.quicksum(a_vars[i] for i in range(self.d)) <= self.b, "budget")
 
         objective = gp.quicksum(a_vars[i] * x_vars[i] for i in range(self.d))
         model.setObjective(objective, GRB.MAXIMIZE)

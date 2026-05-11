@@ -4,14 +4,11 @@ Main simulation: compare algorithms on a simulated random network.
 Corresponds to Figure 1 in the paper. Runs NETC, NSE, and NSE-FS on a
 single randomly generated network with d=100, s=20, T=20000.
 
-NOTE ON REUSED BASELINE RESULTS:
-    The Baseline algorithm call below is intentionally left in source but
-    commented out. For publication runs, Baseline is reused from previous
-    simulations (see output_simulations_main_03022026/). Only NETC, NSE,
-    and NSE-FS are re-run with the final algorithm configurations:
+Algorithm configurations:
       - NSE:    one-hot estimator, tau_constant=0.2
-      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
+      - NSE-FS: OLS, hard-thresholding with threshold_delta=0.05, threshold_constant=8.0
       - NETC:   lambda_explore=0.035
+      - Baseline: lambda_confidence=1, reg_param=0
 
 Usage
 -----
@@ -32,7 +29,7 @@ from algorithms import (
     NETCBandit,
     NSEBandit,
     NSEFSBandit,
-    BaselineBandit,  # still imported for documentation; call site commented below
+    BaselineBandit,
 )
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output_main"
@@ -67,7 +64,6 @@ def _run_single_seed(seed):
     d = 100
     s = 20
     tau = 20000
-    b = 100
     signal_strength = 0.1
     R_max = s * signal_strength
     reg_param = 0
@@ -76,36 +72,37 @@ def _run_single_seed(seed):
     print(f"[seed {seed}] d={d}, s={s}, T={tau}, signal={signal_strength}")
     X = generate_network(seed, d, s, signal_strength)
 
-    # --- Baseline (Algorithm 3) ---
-    # Reused from previous simulation outputs; do not re-run here.
-    # baseline = BaselineBandit(
-    #     X, tau=tau, b=b,
-    #     lambda_confidence=1, reg_param=reg_param, sparsity=s, R_max=R_max,
-    # )
-    # baseline_results = baseline.run()
+    # --- Baseline (Section 3) ---
+    baseline = BaselineBandit(
+        X, tau=tau,
+        lambda_confidence=1, reg_param=reg_param, sparsity=s, R_max=R_max,
+    )
+    baseline_results = baseline.run()
 
-    # --- NETC (Algorithm 2), lambda=0.035 ---
-    netc = NETCBandit(X, tau=tau, b=b, exploration_rounds=T1, lambda_explore=0.035)
+    # --- NETC (Algorithm 3), lambda=0.035 ---
+    netc = NETCBandit(X, tau=tau, exploration_rounds=T1, lambda_explore=0.035)
     netc_results = netc.run()
 
-    # --- NSE (Algorithm 1) with paper's one-hot estimator ---
+    # --- NSE (Algorithm 2) with paper's one-hot estimator ---
     nse = NSEBandit(X, tau=tau, tau_constant=0.2, estimation_method="onehot")
     nse_results = nse.run()
 
-    # --- NSE-FS (Algorithm 4) with ridge ---
-    nsefs = NSEFSBandit(X, tau=tau, alpha=0.05, estimation_alpha=1.0,
-                        estimation_method="ridge")
+    # --- NSE-FS (Algorithm 1) with OLS hard-thresholding ---
+    nsefs = NSEFSBandit(
+        X, tau=tau, threshold_delta=0.05, threshold_constant=8.0,
+        estimation_method="ols",
+    )
     nsefs_results = nsefs.run()
 
     return {
         "seed": seed,
         "parameters": {
-            "d": d, "s": s, "tau": tau, "b": b,
+            "d": d, "s": s, "tau": tau,
             "signal_strength": signal_strength, "R_max": R_max,
             "T1": T1,
         },
         "results": {
-            # "baseline": _json_ready(baseline_results),  # reused from old outputs
+            "baseline": _json_ready(baseline_results),
             "netc": _json_ready(netc_results),
             "nse": _json_ready(nse_results),
             "nsefs": _json_ready(nsefs_results),

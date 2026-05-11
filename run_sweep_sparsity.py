@@ -4,15 +4,6 @@ Sparsity sweep: evaluate algorithms under varying sparsity levels.
 Part of the robustness experiments in Appendix D. Each SGE array task maps
 to a (sparsity, within-bucket seed) pair.
 
-NOTE ON REUSED BASELINE RESULTS:
-    The Baseline algorithm call below is intentionally left in source but
-    commented out. For publication runs, Baseline is reused from previous
-    simulations (see output_simulations_new_sparsity_partial01/). Only NETC,
-    NSE, and NSE-FS are re-run with the final algorithm configurations:
-      - NSE:    one-hot estimator, tau_constant=0.2
-      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
-      - NETC:   lambda_explore=0.035
-
 Usage
 -----
     SGE_TASK_ID=1 python run_sweep_sparsity.py   # s=5,  seed 1
@@ -36,13 +27,12 @@ from algorithms import (
 # --- Default parameters ---
 DEFAULT_D = 100
 DEFAULT_TAU = 20000
-DEFAULT_B = 100
 DEFAULT_SIGNAL_STRENGTH = 0.1
 DEFAULT_T1 = 200
 NETC_LAMBDA = 0.035
 NSE_TAU_CONSTANT = 0.2
-NSEFS_ALPHA = 0.05
-NSEFS_EST_ALPHA = 1.0
+NSEFS_THRESHOLD_DELTA = 0.05
+NSEFS_THRESHOLD_CONSTANT = 8.0
 
 # --- Sweep configuration ---
 SPARSITY_VALUES = [5, 10, 15, 20, 25, 50]
@@ -82,7 +72,6 @@ def _run_single_seed(seed, sparsity):
     d = DEFAULT_D
     s = sparsity
     tau = DEFAULT_TAU
-    b = DEFAULT_B
     signal_strength = DEFAULT_SIGNAL_STRENGTH
     R_max = s * signal_strength
     T1 = DEFAULT_T1
@@ -90,28 +79,29 @@ def _run_single_seed(seed, sparsity):
     print(f"[seed {seed}] s={s}, d={d}, T={tau}, signal={signal_strength}")
     X = generate_network(seed, d, s, signal_strength)
 
-    # --- Baseline (Algorithm 3) ---
+    # --- Baseline (Section 3) ---
     # Reused from previous simulation outputs; do not re-run here.
     # baseline = BaselineBandit(
-    #     X, tau=tau, b=b, lambda_confidence=1, reg_param=0, sparsity=s, R_max=R_max,
+    #     X, tau=tau, lambda_confidence=1, reg_param=0, sparsity=s, R_max=R_max,
     # )
     # baseline_results = baseline.run()
 
-    netc = NETCBandit(X, tau=tau, b=b, exploration_rounds=T1, lambda_explore=NETC_LAMBDA)
+    netc = NETCBandit(X, tau=tau, exploration_rounds=T1, lambda_explore=NETC_LAMBDA)
     netc_results = netc.run()
 
     nse = NSEBandit(X, tau=tau, tau_constant=NSE_TAU_CONSTANT, estimation_method="onehot")
     nse_results = nse.run()
 
-    nsefs = NSEFSBandit(X, tau=tau, alpha=NSEFS_ALPHA,
-                        estimation_alpha=NSEFS_EST_ALPHA,
-                        estimation_method="ridge")
+    nsefs = NSEFSBandit(
+        X, tau=tau, threshold_delta=NSEFS_THRESHOLD_DELTA,
+        threshold_constant=NSEFS_THRESHOLD_CONSTANT, estimation_method="ols",
+    )
     nsefs_results = nsefs.run()
 
     return {
         "seed": seed,
         "parameters": {
-            "d": d, "s": s, "tau": tau, "b": b,
+            "d": d, "s": s, "tau": tau,
             "signal_strength": signal_strength, "R_max": R_max, "T1": T1,
         },
         "results": {

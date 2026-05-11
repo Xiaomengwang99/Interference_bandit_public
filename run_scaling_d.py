@@ -15,15 +15,6 @@ For cluster runs, this means:
     ...
     task 801..900 -> d=900, seeds 1..100
 
-NOTE ON REUSED BASELINE RESULTS:
-    Baseline is not part of this sweep (never was -- excluded at large d).
-    Reuse old NETC/NSE/NSE-FS results is NOT possible: algorithms diverged
-    between old and new code; all three must be re-run here. The final
-    algorithm configurations are:
-      - NSE:    one-hot estimator, tau_constant=0.2
-      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
-      - NETC:   lambda_explore=0.035
-
 Usage
 -----
     SGE_TASK_ID=1 python run_scaling_d.py    # d=100, seed=1
@@ -47,13 +38,12 @@ from algorithms import (
 # --- Default parameters (fixed across the sweep) ---
 DEFAULT_S = 20
 DEFAULT_TAU = 20000
-DEFAULT_B = 100
 DEFAULT_SIGNAL_STRENGTH = 0.1
 DEFAULT_T1 = 200
 NETC_LAMBDA = 0.035
 NSE_TAU_CONSTANT = 0.2
-NSEFS_ALPHA = 0.05
-NSEFS_EST_ALPHA = 1.0
+NSEFS_THRESHOLD_DELTA = 0.05
+NSEFS_THRESHOLD_CONSTANT = 8.0
 
 # --- Sweep configuration ---
 D_VALUES = [100, 200, 300, 400, 500, 600, 700, 800, 900]
@@ -101,15 +91,15 @@ def _run_for_d(seed, d):
 
     X = generate_network(combined_seed, d, s, signal_strength)
 
-    # --- Baseline (Algorithm 3) ---
+    # --- Baseline (Section 3) ---
     # Not part of this experiment due to computational cost at large d.
     # baseline = BaselineBandit(
-    #     X, tau=tau, b=DEFAULT_B, lambda_confidence=1, reg_param=0,
+    #     X, tau=tau, lambda_confidence=1, reg_param=0,
     #     sparsity=s, R_max=s*signal_strength,
     # )
     # baseline_results = baseline.run()
 
-    netc = NETCBandit(X, tau=tau, b=DEFAULT_B, exploration_rounds=DEFAULT_T1,
+    netc = NETCBandit(X, tau=tau, exploration_rounds=DEFAULT_T1,
                       lambda_explore=NETC_LAMBDA)
     netc_results = netc.run()
 
@@ -117,15 +107,16 @@ def _run_for_d(seed, d):
                     estimation_method="onehot")
     nse_results = nse.run()
 
-    nsefs = NSEFSBandit(X, tau=tau, alpha=NSEFS_ALPHA,
-                        estimation_alpha=NSEFS_EST_ALPHA,
-                        estimation_method="ridge")
+    nsefs = NSEFSBandit(
+        X, tau=tau, threshold_delta=NSEFS_THRESHOLD_DELTA,
+        threshold_constant=NSEFS_THRESHOLD_CONSTANT, estimation_method="ols",
+    )
     nsefs_results = nsefs.run()
 
     return {
         "combined_seed": combined_seed,
         "parameters": {
-            "d": d, "s": s, "tau": tau, "b": DEFAULT_B,
+            "d": d, "s": s, "tau": tau,
             "signal_strength": signal_strength, "T1": DEFAULT_T1,
         },
         "results": {

@@ -5,17 +5,14 @@ Corresponds to Figure 3 and Table 2 in the paper. Uses household-level
 adjacency matrices from Banerjee et al. (2013) as the network structure,
 with randomly generated heterogeneous treatment effects.
 
-Each SGE array task ID maps to one of 75 villages. For each village, the
+Each SGE array task ID maps to one of 74 villages. For each village, the
 experiment is repeated NUM_RUNS times with different random seeds.
 
-NOTE ON REUSED BASELINE RESULTS:
-    The Baseline algorithm call below is intentionally left in source but
-    commented out. For publication runs, Baseline is reused from previous
-    simulations (see output_village_new_algos2/). Only NETC, NSE, and
-    NSE-FS are re-run with the final algorithm configurations:
+Algorithm configurations:
       - NSE:    one-hot estimator, tau_constant=0.2
-      - NSE-FS: ridge, alpha=0.05, estimation_alpha=1.0
+      - NSE-FS: OLS, hard-thresholding with threshold_delta=0.05, threshold_constant=8.0
       - NETC:   lambda_explore=0.035
+      - Baseline: lambda_confidence=1, reg_param=0
 
 Usage
 -----
@@ -24,7 +21,6 @@ Usage
 """
 
 import json
-import math
 import os
 from pathlib import Path
 
@@ -44,10 +40,11 @@ SIGNAL_STRENGTH = 0.1
 BASE_SPARSITY = 10
 TAU = 20000
 BASELINE_LAMBDA = 1
+VILLAGE_T1 = 300
 NETC_LAMBDA = 0.035
 NSE_TAU_CONSTANT = 0.2
-NSEFS_ALPHA = 0.05
-NSEFS_EST_ALPHA = 1.0
+NSEFS_THRESHOLD_DELTA = 0.05
+NSEFS_THRESHOLD_CONSTANT = 8.0
 NUM_RUNS = 5
 RUN_SEED_OFFSET = 10000
 
@@ -87,23 +84,21 @@ def _run_single(X, village_number, run_index, run_seed):
     """Run all algorithms on one village with one random seed."""
     d = X.shape[0]
     s = min(BASE_SPARSITY, d)
-    b = d
     tau = TAU
     R_max = s * SIGNAL_STRENGTH
-    T1 = math.ceil(2 * s * np.log(2 * d * max(tau, 1)))
+    T1 = VILLAGE_T1
 
     print(f"[village {village_number}, run {run_index + 1}] d={d}, s={s}, T1={T1}")
 
-    # --- Baseline (Algorithm 3) ---
-    # Reused from previous simulation outputs; do not re-run here.
-    # baseline = BaselineBandit(
-    #     X, tau=tau, b=b, lambda_confidence=BASELINE_LAMBDA,
-    #     reg_param=0, sparsity=s, R_max=R_max, random_state=run_seed + 1,
-    # )
-    # baseline_results = baseline.run()
+    # --- Baseline (Section 3) ---
+    baseline = BaselineBandit(
+        X, tau=tau, lambda_confidence=BASELINE_LAMBDA,
+        reg_param=0, sparsity=s, R_max=R_max, random_state=run_seed + 1,
+    )
+    baseline_results = baseline.run()
 
     netc = NETCBandit(
-        X, tau=tau, b=b, exploration_rounds=T1,
+        X, tau=tau, exploration_rounds=T1,
         lambda_explore=NETC_LAMBDA, random_state=run_seed + 2,
     )
     netc_results = netc.run()
@@ -115,9 +110,9 @@ def _run_single(X, village_number, run_index, run_seed):
     nse_results = nse.run()
 
     nsefs = NSEFSBandit(
-        X, tau=tau, alpha=NSEFS_ALPHA,
-        estimation_alpha=NSEFS_EST_ALPHA,
-        estimation_method="ridge", random_state=run_seed + 5,
+        X, tau=tau, threshold_delta=NSEFS_THRESHOLD_DELTA,
+        threshold_constant=NSEFS_THRESHOLD_CONSTANT,
+        estimation_method="ols", random_state=run_seed + 5,
     )
     nsefs_results = nsefs.run()
 
@@ -125,12 +120,12 @@ def _run_single(X, village_number, run_index, run_seed):
         "run_index": run_index,
         "run_seed": run_seed,
         "parameters": {
-            "d": d, "s": s, "tau": tau, "b": b,
+            "d": d, "s": s, "tau": tau,
             "signal_strength": SIGNAL_STRENGTH, "R_max": R_max, "T1": T1,
             "village_number": village_number,
         },
         "results": {
-            # "baseline": _json_ready(baseline_results),  # reused from old outputs
+            "baseline": _json_ready(baseline_results),
             "netc": _json_ready(netc_results),
             "nse": _json_ready(nse_results),
             "nsefs": _json_ready(nsefs_results),

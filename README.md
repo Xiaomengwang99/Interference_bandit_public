@@ -24,7 +24,7 @@ NSE-FS is minimax-optimal (matches the lower bound up to log factors); NSE is ne
 ```
 .
 ├── algorithms.py           # All algorithm implementations and data generation
-├── run_main.py             # Main experiment (Figure 1): NETC / NSE / NSE-FS, d=100
+├── run_main.py             # Main experiment (Figure 1): Baseline / NETC / NSE / NSE-FS, d=100
 ├── run_scaling_d.py        # Scaling experiment (Figure 2): regret vs. d (100..900)
 ├── run_sweep_signal.py     # Signal strength sweep (Appendix D)
 ├── run_sweep_sparsity.py   # Sparsity sweep (Appendix D)
@@ -39,11 +39,11 @@ Each `run_*.py` script writes JSON results to a dedicated `output_*/` directory 
 The publication runs use the following pinned hyperparameters across all experiments:
 
 - **NSE**: one-hot estimator, `tau_constant=0.2`
-- **NSE-FS**: ridge estimator, `alpha=0.05`, `estimation_alpha=1.0`
-- **NETC**: `lambda_explore=0.035`, `T1=200` exploration rounds (in `run_village.py`, `T1 = ceil(2 s log(2dT))`)
+- **NSE-FS**: OLS estimator with hard-threshold elimination, `threshold_delta=0.05`, `threshold_constant=8.0`
+- **NETC**: `lambda_explore=0.035`, `T1=200` exploration rounds (in `run_village.py`, `T1=300`)
 - **Baseline**: `lambda_confidence=1`, `reg_param=0`
 
-In every `run_*.py` script except `run_scaling_d.py`, the `BaselineBandit` call is intentionally commented out: Baseline results are re-used from earlier simulation outputs and merged at plotting time. To regenerate Baseline from scratch, uncomment the `baseline = BaselineBandit(...)` block and the corresponding entry in the returned `results` dict. Baseline is excluded entirely from `run_scaling_d.py` because of its computational cost at large `d`.
+Baseline is run in `run_main.py` and `run_village.py`. It is intentionally omitted from `run_scaling_d.py` because of its computational cost at large `d`, and it is commented out in `run_sweep_signal.py` and `run_sweep_sparsity.py`; baseline curves for the sweep plots can be reused from earlier outputs or merged at plotting time. To regenerate sweep baselines, uncomment the `BaselineBandit(...)` block and the corresponding entry in the returned `results` dict.
 
 ## Requirements
 
@@ -73,7 +73,7 @@ If neither is provided, the script defaults to task ID 1.
 
 ### Main experiment (Figure 1)
 
-Compares NETC, NSE, and NSE-FS on a simulated network with `d=100`, `s=20`, `T=20000`, `signal_strength=0.1`.
+Compares Baseline, NETC, NSE, and NSE-FS on a simulated network with `d=100`, `s=20`, `T=20000`, `signal_strength=0.1`.
 
 ```bash
 python run_main.py                                # seed=1
@@ -93,7 +93,7 @@ SGE_TASK_ID=150 python run_scaling_d.py   # d=200, seed_within_d=50
 python run_scaling_d.py --task-start 1 --task-end 900   # full local sweep
 ```
 
-Results are saved to `output_scaling_d/d_<d>_seed_<s>.json`.
+Results are saved to `output_scaling_d/d_<d>_seed_<seed_within_d>.json`.
 
 ### Signal strength and sparsity sweeps (Appendix D)
 
